@@ -36,6 +36,10 @@
 
 // Standard includes
 #include <stdlib.h>
+#include <stdbool.h>
+//#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
 
 // simplelink includes
 #include "simplelink.h"
@@ -49,6 +53,11 @@
 #include "prcm.h"
 #include "uart.h"
 #include "timer.h"
+#include "hw_common_reg.h"
+#include "spi.h"
+#include "rom.h"
+#include "utils.h"
+#include "timer.h"
 
 // common interface includes
 #include "network_if.h"
@@ -61,6 +70,9 @@
 #include "timer_if.h"
 #include "common.h"
 #include "utils.h"
+
+//#include "systick_if.h"
+#include "timer_if.h"
 
 
 #include "sl_mqtt_client.h"
@@ -94,7 +106,7 @@
 #define TASK_PRIORITY           3
 
 /* Keep Alive Timer value*/
-#define KEEP_ALIVE_TIMER        25
+#define KEEP_ALIVE_TIMER        100
 
 /*Clean session flag*/
 #define CLEAN_SESSION           true
@@ -103,16 +115,13 @@
 #define RETAIN                  0//1
 
 /*Defining Publish Topic*/
-#define PUB_TOPIC_FOR_SW3       "/cc3200/ButtonPressEvtSw3"
-//#define PUB_TOPIC_FOR_SW2       "/cc3200/ButtonPressEvtSw2"
+#define PUB_TOPIC_FOR_HBR       "/cc3200/HBR_Sending"
 
 /*Defining Number of topics*/
 #define TOPIC_COUNT             1
 
 /*Defining Subscription Topic Values*/
-#define TOPIC1                  "/cc3200/ButtonPressEvtSw2"//"/cc3200/ToggleLEDCmdL1"
-#define TOPIC2                  "/cc3200/ToggleLEDCmdL2"
-#define TOPIC3                  "/cc3200/ToggleLEDCmdL3"
+#define TOPIC1                  "/cc3200/HBR_Requesting"
 
 /*Defining QOS levels*/
 #define QOS0                    0
@@ -124,12 +133,40 @@
 #define UART_PRINT              Report
 
 //NEED TO UPDATE THIS FOR IT TO WORK!
-#define DATE                5   /* Current Date */
+#define DATE                6   /* Current Date */
 #define MONTH               12     /* Month 1-12 */
 #define YEAR                2019  /* Current year */
-#define HOUR                18   /* Time - hours */
-#define MINUTE              16    /* Time - minutes */
+#define HOUR                14   /* Time - hours */
+#define MINUTE              36    /* Time - minutes */
 #define SECOND              6    /* Time - seconds */
+
+//*****************************************************************************
+//
+// Application Master/Slave mode selector macro
+//
+// MASTER_MODE = 1 : Application in master mode
+// MASTER_MODE = 0 : Application in slave mode
+//
+//*****************************************************************************
+#define MASTER_MODE      1
+
+#define SYS_CLK                 80000000
+#define SPI_IF_BIT_RATE  10000 //10000
+#define TR_BUFF_SIZE     100
+#define SAMPLES_PER_SECOND SPI_IF_BIT_RATE/16
+
+#define MASTER_MSG       "This is CC3200 SPI Master Application\n\r"
+#define SLAVE_MSG        "This is CC3200 SPI Slave Application\n\r"
+
+#define NUMSAMPLE       2000
+
+#define SLOW_TIMER_DELAY_uS 2000
+
+#define FILTER_LEN  5
+double coeffs[ FILTER_LEN ] =
+{
+  -0.0110, 0.0939, 0.4895, 0.4895, 0.0939//, -0.0110
+};
 
 typedef struct
 {
@@ -165,7 +202,7 @@ typedef struct connection_config{
 typedef enum
 {
     PUSH_BUTTON_SW2_PRESSED,
-    PUSH_BUTTON_SW3_PRESSED,
+    HBR_REQUESTED,
     BROKER_DISCONNECTION
 }events;
 
@@ -176,6 +213,34 @@ typedef struct
 }event_msg;
 
 //*****************************************************************************
+//                 GLOBAL VARIABLES -- Start
+//*****************************************************************************
+static unsigned short g_ucTxBuff[TR_BUFF_SIZE];
+static unsigned short g_ucRxBuff[TR_BUFF_SIZE];
+static unsigned char ucTxBuffNdx;
+static unsigned char ucRxBuffNdx;
+unsigned long TimerInts;
+
+static unsigned long g_ulA2IntCount;
+
+// array to hold input samples
+//double insamp[2000];
+
+//float floatInput[NUMSAMPLE];
+
+
+#if defined(ccs)
+extern void (* const g_pfnVectors[])(void);
+#endif
+#if defined(ewarm)
+extern uVectorEntry __vector_table;
+#endif
+//*****************************************************************************
+//                 GLOBAL VARIABLES -- End
+//*****************************************************************************
+
+
+//*****************************************************************************
 //                      LOCAL FUNCTION PROTOTYPES
 //*****************************************************************************
 static void
@@ -184,15 +249,21 @@ Mqtt_Recv(void *app_hndl, const char  *topstr, long top_len, const void *payload
 static void sl_MqttEvt(void *app_hndl,long evt, const void *buf,
                        unsigned long len);
 static void sl_MqttDisconnect(void *app_hndl);
-void pushButtonInterruptHandler2();
 void pushButtonInterruptHandler3();
-void ToggleLedState(ledEnum LedNum);
 void TimerPeriodicIntHandler(void);
 void LedTimerConfigNStart();
 void LedTimerDeinitStop();
 void BoardInit(void);
 static void DisplayBanner(char * AppName);
 void MqttClient(void *pvParameters);
+
+static void TimerA1IntHandler(void);
+void MasterMain();
+void firFloatInit(void);
+void firFloat( double *coeffs, double *input, double *output, int length, int filterLength );
+float findMax(float* InArray, int size, int* index, float* temp);
+float findMin(float* InArray, int size, int* index, float* temp);
+int HBR_Detection(void);
 
 
 static int set_time();
@@ -264,14 +335,198 @@ SlMqttClientLibCfg_t Mqtt_Client={
 
 /*Publishing topics and messages*/
 //const char *pub_topic_sw2 = PUB_TOPIC_FOR_SW2;
-const char *pub_topic_sw3 = PUB_TOPIC_FOR_SW3;
+const char *pub_topic_hbr = PUB_TOPIC_FOR_HBR;
 //unsigned char *data_sw2={"Push button sw2 is pressed on CC32XX device"};
-unsigned char *data_sw3={"Push button sw3 is pressed on CC32XX device"};
+
+
+//Request message from nurse board
+const char *HBRRequest = {"HBR is requested by the nurse."};
 
 void *app_hndl = (void*)usr_connect_config;
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- End
 //*****************************************************************************
+
+
+//*****************************************************************************
+//
+//! \TimerA0IntHandler
+//!
+//! Handles interrupts for Timer A2.
+//! This interrupt handler clears the source of the interrupt and
+//! increments a counter and returns.
+//!
+//! \param None.
+//!
+//! \return None.
+//
+//*****************************************************************************
+static void
+TimerA1IntHandler(void)
+{
+    unsigned long ulStatus;
+
+    //
+    // Clear all interrupts for Timer.
+    //
+    ulStatus = TimerIntStatus(TIMERA1_BASE, true);
+    TimerIntClear(TIMERA1_BASE, ulStatus);
+
+    //
+    // Increment our global interrupt counter.
+    //
+    g_ulA2IntCount++;
+
+}
+
+//*****************************************************************************
+//
+//! SPI Master mode main loop
+//!
+//! This function configures SPI module as master and enables the channel for
+//! communication
+//!
+//! \return None.
+//
+//*****************************************************************************
+void MasterMain()
+{
+
+    unsigned long ulUserData;
+    unsigned long ulDummy;
+
+    //
+    // Initialize the message
+    //
+    memcpy(g_ucTxBuff,MASTER_MSG,sizeof(MASTER_MSG));
+
+    //
+    // Set Tx buffer index
+    //
+    ucTxBuffNdx = 0;
+    ucRxBuffNdx = 0;
+
+    //
+    // Reset SPI
+    //
+    SPIReset(GSPI_BASE);
+
+    //
+    // Configure SPI interface
+    //
+    SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                     SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                     (SPI_SW_CTRL_CS |
+                     SPI_4PIN_MODE |
+                     SPI_TURBO_OFF |
+                     SPI_CS_ACTIVELOW |
+                     SPI_WL_16));
+
+    //
+    // Enable SPI for communication
+    //
+    SPIEnable(GSPI_BASE);
+
+    //
+    // Print mode on uart
+    //
+    Message("Enabled SPI Interface in Master Mode\n\r");
+
+
+    //
+    // Send the string to slave. Chip Select(CS) needs to be
+    // asserted at start of transfer and deasserted at the end.
+    //
+    SPITransfer(GSPI_BASE,g_ucTxBuff,g_ucRxBuff,50,
+            SPI_CS_ENABLE|SPI_CS_DISABLE);
+
+    //
+    // Initialize variable
+    //
+    ulUserData = 0;
+
+
+}
+
+
+/***************************************************************************************
+*    Title: Filter Code Definitions
+*    Author: Shawn
+*    Date: 10/29/2019
+*    Code version: 1.0
+*    Availability: https://sestevenson.wordpress.com/implementation-of-fir-filtering-in-c-part-1/
+*
+***************************************************************************************/
+/*
+// FIR init
+void firFloatInit( void )
+{
+    memset( insamp, 0, sizeof( insamp ) );
+}
+
+// the FIR filter function
+void firFloat( double *coeffs, double *input, double *output,
+       int length, int filterLength )
+{
+    double acc;     // accumulator for MACs
+    double *coeffp; // pointer to coefficients
+    double *inputp; // pointer to input samples
+    int n;
+    int k;
+
+    // put the new samples at the high end of the buffer
+    memcpy( &insamp[filterLength - 1], input,
+            length * sizeof(double) );
+
+    // apply the filter to each input sample
+    for ( n = 0; n < length; n++ ) {
+        // calculate output n
+        coeffp = coeffs;
+        inputp = &insamp[filterLength - 1 + n];
+        acc = 0;
+        for ( k = 0; k < filterLength; k++ ) {
+            acc += (*coeffp++) * (*inputp--);
+        }
+        output[n] = acc;
+    }
+    // shift input samples back in time for next time
+    memmove( &insamp[0], &insamp[length],
+            (filterLength - 1) * sizeof(double) );
+
+}
+*/
+
+//Helper function to find local max
+float findMax(float* InArray, int size, int* index, float* temp){
+    int i = 0;
+    temp = InArray;
+    float max = -1;
+    for(i = 0; i < size; i++){
+        if(temp[i] > max){
+            max = temp[i];
+            *index = i;
+        }
+    }
+    return max;
+
+}
+
+
+//Helper function to find local min
+float findMin(float* InArray, int size, int* index, float* temp){
+    int i = 0;
+
+    temp = InArray;
+    float min = 10000;
+    for(i = 0; i < size; i++){
+        if(temp[i] < min){
+            min = temp[i];
+            *index = i;
+        }
+    }
+    return min;
+
+}
 
 //****************************************************************************
 //! Defines Mqtt_Pub_Message_Receive event handler.
@@ -299,22 +554,8 @@ Mqtt_Recv(void *app_hndl, const char  *topstr, long top_len, const void *payload
     strncpy(output_str, (char*)topstr, top_len);
     output_str[top_len]='\0';
 
-/*
-    if(strncmp(output_str,TOPIC1, top_len) == 0)
-    {
-        ToggleLedState(LED1);
-    }
-    else if(strncmp(output_str,TOPIC2, top_len) == 0)
-    {
-        ToggleLedState(LED2);
-    }
-    else if(strncmp(output_str,TOPIC3, top_len) == 0)
-    {
-        ToggleLedState(LED3);
-    }
-    */
-
     UART_PRINT("\n\rPublish Message Received");
+    UART_PRINT("\n\r Test Test");                 ////////////////////////////////////////////////////////
     UART_PRINT("\n\rTopic: ");
     UART_PRINT("%s",output_str);
     free(output_str);
@@ -329,7 +570,17 @@ Mqtt_Recv(void *app_hndl, const char  *topstr, long top_len, const void *payload
     strncpy(output_str, (char*)payload, pay_len);
     output_str[pay_len]='\0';
     UART_PRINT("\n\rData is: ");
+    UART_PRINT("\n\r Test2 Test2");
     UART_PRINT("%s",(char*)output_str);
+    if(output_str != NULL){
+        event_msg msg;
+        msg.event = HBR_REQUESTED;
+        msg.hndl = NULL;
+        //
+        // write message indicating exit from sending loop
+        //
+        osi_MsgQWrite(&g_PBQueue,&msg,OSI_NO_WAIT);
+    }
     UART_PRINT("\n\r");
     free(output_str);
     
@@ -414,29 +665,6 @@ sl_MqttDisconnect(void *app_hndl)
 
 //****************************************************************************
 //
-//! Push Button Handler1(GPIOS2). Press push button2 (GPIOSW2) Whenever user
-//! wants to publish a message. Write message into message queue signaling the
-//!    event publish messages
-//!
-//! \param none
-//!
-//! return none
-//
-//****************************************************************************
-void pushButtonInterruptHandler2()
-{
-    event_msg msg;
-
-    msg.event = PUSH_BUTTON_SW2_PRESSED;
-    msg.hndl = NULL;
-    //
-    // write message indicating publish message
-    //
-    osi_MsgQWrite(&g_PBQueue,&msg,OSI_NO_WAIT);
-}
-
-//****************************************************************************
-//
 //! Push Button Handler3(GPIOS3). Press push button3 (GPIOSW3) Whenever user
 //! wants to publish a message. Write message into message queue signaling the
 //!    event publish messages
@@ -449,7 +677,7 @@ void pushButtonInterruptHandler2()
 void pushButtonInterruptHandler3()
 {
     event_msg msg;
-    msg.event = PUSH_BUTTON_SW3_PRESSED;
+    msg.event = HBR_REQUESTED;
     msg.hndl = NULL;
     //
     // write message indicating exit from sending loop
@@ -458,57 +686,6 @@ void pushButtonInterruptHandler3()
 
 }
 
-//****************************************************************************
-//
-//!    Toggles the state of GPIOs(LEDs)
-//!
-//! \param LedNum is the enumeration for the GPIO to be toggled
-//!
-//!    \return none
-//
-//****************************************************************************
-void ToggleLedState(ledEnum LedNum)
-{
-    unsigned char ledstate = 0;
-    switch(LedNum)
-    {
-    case LED1:
-        ledstate = GPIO_IF_LedStatus(MCU_RED_LED_GPIO);
-        if(!ledstate)
-        {
-            GPIO_IF_LedOn(MCU_RED_LED_GPIO);
-        }
-        else
-        {
-            GPIO_IF_LedOff(MCU_RED_LED_GPIO);
-        }
-        break;
-    case LED2:
-        ledstate = GPIO_IF_LedStatus(MCU_ORANGE_LED_GPIO);
-        if(!ledstate)
-        {
-            GPIO_IF_LedOn(MCU_ORANGE_LED_GPIO);
-        }
-        else
-        {
-            GPIO_IF_LedOff(MCU_ORANGE_LED_GPIO);
-        }
-        break;
-    case LED3:
-        ledstate = GPIO_IF_LedStatus(MCU_GREEN_LED_GPIO);
-        if(!ledstate)
-        {
-            GPIO_IF_LedOn(MCU_GREEN_LED_GPIO);
-        }
-        else
-        {
-            GPIO_IF_LedOff(MCU_GREEN_LED_GPIO);
-        }
-        break;
-    default:
-        break;
-    }
-}
 
 //*****************************************************************************
 //
@@ -622,6 +799,210 @@ void BoardInit(void)
     PRCMCC3200MCUInit();
 }
 
+
+int HBR_Detection(void){
+    unsigned long ulRecvData;
+    int sampSize = 0;
+    int j = 0;
+    int k = 0;
+    int p = 0;
+    float realV = 0;
+    unsigned long prevValue = 0;
+    float localMax = 0;
+    float localMin = 0;
+
+    float *floatInput;
+    floatInput = (float *)malloc(NUMSAMPLE * sizeof(float));          //2000
+    //float floatInput[NUMSAMPLE];
+    float *floatInputHalf;
+    floatInputHalf = (float *)malloc(NUMSAMPLE/5 * sizeof(float));
+
+    int tempMaxIdx;
+    int tempMinIdx;
+    int localMaxIdx;
+    int localMinIdx;
+    int numDrops;
+    int HBR;
+    int traverseSize = 10;
+    float maxDiff;
+    float localDiff;
+    unsigned long startTime = 0;
+    unsigned long endTime = 0;
+    float durationTime = 0;
+    int sucTime = 0;
+    int lastHBR = 0;
+    int numFails = 0;
+
+
+    float *tempArray;
+    tempArray = (float *)malloc(traverseSize * sizeof(float));       //malloc an array with size traverseSize
+    float *tempMax;
+    tempMax = (float *)malloc(traverseSize * sizeof(float));
+    float *tempMin;
+    tempMin = (float *)malloc(traverseSize * sizeof(float));
+
+    g_ulA2IntCount = 0;
+
+
+    // Configuring the timers
+    //
+    Timer_IF_Init(PRCM_TIMERA1, TIMERA1_BASE, TIMER_CFG_PERIODIC, TIMER_A, 0);
+
+    //
+    // Setup the interrupts for the timer timeouts.
+    //
+    Timer_IF_IntSetup(TIMERA1_BASE, TIMER_A, TimerA1IntHandler);
+
+    Timer_IF_Start(TIMERA1_BASE, TIMER_A, 1); //10ms
+
+    while(1){
+        sampSize = 0;
+        j=0;
+        k = 1;
+        Message("Detecting....Don't move.\n\r");
+        startTime = g_ulA2IntCount;
+        while(j<NUMSAMPLE)
+        {
+            //
+            // Enable Chip select
+            //
+            SPICSEnable(GSPI_BASE);
+
+            SPIDataPut(GSPI_BASE,g_ucTxBuff[ucTxBuffNdx%TR_BUFF_SIZE]);
+            ucTxBuffNdx++;
+
+            SPIDataGet(GSPI_BASE,&ulRecvData);
+            g_ucTxBuff[ucRxBuffNdx%TR_BUFF_SIZE] = ulRecvData;
+            ulRecvData = ulRecvData >> 3;
+            ulRecvData = (ulRecvData & 0x7FF);
+
+            realV = (float)(ulRecvData * 3.3 / 1024);
+            //Report("%f\n\r",realV);
+
+            //Take every 3 samples
+            if(k == 3){
+                //prevValue = g_ulA2IntCount;
+                floatInput[j] = realV;
+                //Report("%f\n\r",floatInput[j]);
+                ucRxBuffNdx++;
+                j++;
+                k = 0;
+            }
+
+            k++;
+
+
+           //
+           // Disable chip select
+           //
+           SPICSDisable(GSPI_BASE);
+        }
+
+        endTime = g_ulA2IntCount;
+        durationTime = (int)(endTime - startTime) * 0.001;
+        Report("duration time is %f \n\r", durationTime);
+
+        int downRate = 5;
+
+        //Down sampling
+        k = 1;
+        p=0;
+        for(j = 0; j < NUMSAMPLE; j++){
+            //Sampling for every 5 samples
+            if(k == downRate){
+                floatInputHalf[p] = floatInput[j];
+                //Report("    %f\n\r",floatInputHalf[p]);
+                p++;
+                k = 0;
+            }
+            k++;
+        }
+
+        sampSize = NUMSAMPLE/(downRate);
+        tempMaxIdx = -1;
+        tempMinIdx = -1;
+        localMaxIdx = -1;
+        localMinIdx = -1;
+        numDrops = 0;
+        HBR = 0;
+        traverseSize = 10;
+        maxDiff = 0;
+        localDiff = 0;
+
+        for(k = 0; k < sampSize - traverseSize; k++){
+            for(j = 0; j < traverseSize; j++){
+                tempArray[j] = floatInputHalf[k+j];
+                //Report("realV is %f \n\r", tempArray[j]);
+            }
+            //tempArray = &(floatInputHalf[k]);
+            localMax = findMax(tempArray, traverseSize, &tempMaxIdx, tempMax);
+            localMin = findMin(tempArray, traverseSize, &tempMinIdx, tempMin);
+            localDiff = localMax - localMin;
+            if((localDiff > maxDiff) && (tempMaxIdx < tempMinIdx) && (localDiff < 0.1)){
+                maxDiff = localDiff;
+            }
+        }
+
+        //Report("        maxDiff is %f \n\r", maxDiff);
+
+        k = 0;
+        while(k < (sampSize - traverseSize)){
+            for(j = 0; j < traverseSize; j++){
+                tempArray[j] = floatInputHalf[k+j];
+                //Report("realV is %f \n\r", tempArray[j]);
+            }
+            //tempArray = &(floatInputHalf[k]);
+            localMax = findMax(tempArray, traverseSize, &tempMaxIdx, tempMax);
+            localMin = findMin(tempArray, traverseSize, &tempMinIdx, tempMin);
+            if((localMax-localMin) > (maxDiff * 0.6) && (tempMaxIdx < tempMinIdx)){//Drop found
+                localMaxIdx = tempMaxIdx + k;
+                localMinIdx = tempMinIdx + k;
+                numDrops++;
+                k = localMinIdx - 1;        //Increment by 1 outside
+            }
+            k++;
+        }
+
+        Report("Num Drop is %d \n\r", numDrops);
+        HBR = (int)(numDrops / durationTime * 60);
+
+        //Report("Your Heart Beat Rate is %d bpm\n\r", HBR);
+
+
+
+        if(HBR > 50 && HBR < 200 && sucTime == 0){
+            Report("Your Heart Beat Rate is %d bpm\n\r", HBR);
+            lastHBR = HBR;
+            sucTime++;
+        }else if(HBR > 50 && HBR < 200 && sucTime == 1){
+            if((HBR < lastHBR + 10) && (HBR > lastHBR - 10)){
+                HBR = (lastHBR + HBR) / 2;
+                Report("Measurement Completed. Your Heart Beat Rate is %d bpm\n\r", HBR);
+                break;
+            }
+        }else{
+            Message("Measurement Failed: Keep your finger on!\n\r");
+            numFails++;
+            lastHBR = 0;
+            sucTime = 0;
+            if(numFails >= 5){
+                HBR = 0;
+                break;
+            }
+        }
+
+
+    }
+
+
+    free(floatInput);
+    TimerDisable(TIMERA1_BASE, TIMER_A);
+    TimerIntDisable(TIMERA1_BASE, TIMER_TIMA_TIMEOUT);
+
+
+    return HBR;
+}
+
 //*****************************************************************************
 //
 //! Application startup display on UART
@@ -643,6 +1024,7 @@ DisplayBanner(char * AppName)
 }
   
 extern volatile unsigned long g_ulStatus;
+
 //*****************************************************************************
 //
 //! Task implementing MQTT client communication to other web client through
@@ -669,6 +1051,8 @@ void MqttClient(void *pvParameters)
     event_msg RecvQue;
     unsigned char policyVal;
     
+
+
     connect_config *local_con_conf = (connect_config *)app_hndl;
 
     //
@@ -746,7 +1130,7 @@ void MqttClient(void *pvParameters)
     //
     // Register Push Button Handlers
     //
-    Button_IF_Init(pushButtonInterruptHandler2,pushButtonInterruptHandler3);
+    //Button_IF_Init(pushButtonInterruptHandler2,pushButtonInterruptHandler3);
 
     //
     // Initialze MQTT client lib
@@ -878,32 +1262,32 @@ connect_to_broker:
     for(;;)
     {
         osi_MsgQRead( &g_PBQueue, &RecvQue, OSI_WAIT_FOREVER);
-        /*
-        if(PUSH_BUTTON_SW2_PRESSED == RecvQue.event)
+        if(HBR_REQUESTED == RecvQue.event)
         {
-            Button_IF_EnableInterrupt(SW2);
-            //
-            // send publish message
-            //
-            sl_ExtLib_MqttClientSend((void*)local_con_conf[iCount].clt_ctx,
-                    pub_topic_sw2,data_sw2,strlen((char*)data_sw2),QOS1,RETAIN);
-            UART_PRINT("\n\r CC3200 Publishes the following message \n\r");
-            UART_PRINT("Topic: %s\n\r",pub_topic_sw2);
-            UART_PRINT("Data: %s\n\r",data_sw2);
-        }
+            UART_PRINT("Heart Rate Detecting...\n\r");
 
-        else */
-        if(PUSH_BUTTON_SW3_PRESSED == RecvQue.event)
-        {
-            Button_IF_EnableInterrupt(SW3);
+            int HBR = HBR_Detection();
+
+            char data_send [10];
+
+            //char *data_send = "80";
+
+            UART_PRINT("HBR: %d\n\r",HBR);
+
+            itoa((short)HBR, data_send);
+
+            //strcat(data_send, "\0");
+
+            //UART_PRINT("HBR_String: %s\n\r",data_send);
+            //Button_IF_EnableInterrupt(SW3);
             //
             // send publish message
             //
             sl_ExtLib_MqttClientSend((void*)local_con_conf[iCount].clt_ctx,
-                    pub_topic_sw3,data_sw3,strlen((char*)data_sw3),QOS1,RETAIN);
+                    pub_topic_hbr,(const void*)data_send,strlen((char*)data_send),QOS1,RETAIN);
             UART_PRINT("\n\r CC3200 Publishes the following message \n\r");
-            UART_PRINT("Topic: %s\n\r",pub_topic_sw3);
-            UART_PRINT("Data: %s\n\r",data_sw3);
+            UART_PRINT("Topic: %s\n\r",pub_topic_hbr);
+            UART_PRINT("Data: %s\n\r",data_send);
         }
         else if(BROKER_DISCONNECTION == RecvQue.event)
         {
@@ -975,9 +1359,21 @@ void main()
     InitTerm();
 
     //
+    // Clearing the Terminal.
+    //
+    ClearTerm();
+
+    //
     // Display Application Banner
     //
-    DisplayBanner("MQTT_Client");
+    DisplayBanner("Heart Beat Monitoring - Patient");
+
+    //
+    // Reset the peripheral
+    //
+    PRCMPeripheralReset(PRCM_GSPI);
+
+    MasterMain();
 
     //
     // Start the SimpleLink Host
